@@ -128,6 +128,45 @@ function parseBackpressureStats(statsText) {
   };
 }
 
+function resolveQueueSignals(queue) {
+  const pendingStats = parsePendingEpochStats(pick(queue, ['pendingEpochStats'], ''));
+  const backpressureStats = parseBackpressureStats(pick(queue, ['backpressureStats'], ''));
+
+  const queuePending = Math.max(
+    toNum(pick(queue, ['pendingCount', 'pending'], 0), 0),
+    toNum(pick(queue, ['batchQueueSize'], 0), 0),
+    toNum(pendingStats.pendingProposals, 0),
+  );
+  const mempool = toNum(
+    pick(queue, ['mempoolPendingCount', 'mempoolCount', 'mempool', 'mempoolSize', 'unverifiedQueueSize'], 0),
+    0,
+  );
+  const backpressurePending = Math.max(
+    toNum(pick(queue, ['backpressurePendingCount'], 0), 0),
+    toNum(backpressureStats.pending, 0),
+  );
+  const backpressureMax = Math.max(
+    toNum(pick(queue, ['backpressureMaxPending'], 0), 0),
+    toNum(backpressureStats.max, 0),
+  );
+  const pendingEpochs = toNum(pendingStats.pendingEpochs, 0);
+  const totalQueuedFromStats = toNum(pendingStats.totalQueued, null);
+
+  return {
+    queuePending,
+    mempool,
+    backpressurePending,
+    backpressureMax,
+    backpressureActive: Boolean(
+      pick(queue, ['backpressureActive'], false) || backpressureStats.active === true,
+    ),
+    backpressureSent: toNum(backpressureStats.sent, 0),
+    backpressureAcked: toNum(backpressureStats.acked, 0),
+    pendingEpochs,
+    totalQueuedFromStats,
+  };
+}
+
 function formatBytes(bytes) {
   const value = Number(bytes);
   if (!Number.isFinite(value) || value <= 0) return '0 B';
@@ -264,18 +303,7 @@ async function resolveOverview() {
     reachableNodes,
   );
   const status = reachableValidators > 0 ? 'healthy' : 'degraded';
-  const pendingStats = parsePendingEpochStats(pick(queue, ['pendingEpochStats'], ''));
-  const pendingCandidates = [
-    toNum(pick(queue, ['pendingCount', 'pending'], 0), 0),
-    toNum(pick(queue, ['batchQueueSize'], 0), 0),
-    toNum(pick(queue, ['backpressurePendingCount'], 0), 0),
-    toNum(pendingStats.pendingProposals, 0),
-  ];
-  const pendingResolved = Math.max(...pendingCandidates);
-  const mempoolResolved = toNum(
-    pick(queue, ['mempoolPendingCount', 'mempoolCount', 'mempool', 'mempoolSize', 'unverifiedQueueSize'], 0),
-    0,
-  );
+  const signals = resolveQueueSignals(queue);
 
   return {
     status,
@@ -291,8 +319,10 @@ async function resolveOverview() {
       reachableNodes: reachableValidators,
     },
     queue: {
-      pending: pendingResolved,
-      mempool: mempoolResolved,
+      pending: signals.queuePending,
+      queuePending: signals.queuePending,
+      mempool: signals.mempool,
+      backpressurePending: signals.backpressurePending,
       oldestPendingAgeMs: toNum(pick(queue, ['oldestPendingAgeMs', 'oldestAgeMs'], 0), 0),
     },
     replication: {
@@ -436,26 +466,19 @@ async function resolveReplication() {
 async function resolveQueue() {
   const leaderBase = await resolveLeaderUpstreamBase();
   const queue = await upstreamGetSnapshot('/v1/ops/snapshots/queue', '/v1/proposals/queue/stats', leaderBase);
-  const pendingStats = parsePendingEpochStats(pick(queue, ['pendingEpochStats'], ''));
-  const pendingCandidates = [
-    toNum(pick(queue, ['pendingCount', 'pending'], 0), 0),
-    toNum(pick(queue, ['batchQueueSize'], 0), 0),
-    toNum(pick(queue, ['backpressurePendingCount'], 0), 0),
-    toNum(pendingStats.pendingProposals, 0),
-  ];
-  const pendingResolved = Math.max(...pendingCandidates);
-  const mempoolResolved = toNum(
-    pick(queue, ['mempoolPendingCount', 'mempoolCount', 'mempool', 'mempoolSize', 'unverifiedQueueSize'], 0),
-    0,
-  );
+  const signals = resolveQueueSignals(queue);
   const epochDepthResolved = Math.max(
     toNum(pick(queue, ['epochQueueDepth', 'epochDepth', 'epochsUntilFinality'], 0), 0),
-    toNum(pendingStats.pendingEpochs, 0),
+    signals.pendingEpochs,
   );
 
   return {
-    pendingCount: pendingResolved,
-    mempoolCount: mempoolResolved,
+    pendingCount: signals.queuePending,
+    queuePendingCount: signals.queuePending,
+    mempoolCount: signals.mempool,
+    backpressurePendingCount: signals.backpressurePending,
+    backpressureMaxPending: signals.backpressureMax,
+    backpressureActive: signals.backpressureActive,
     epochQueueDepth: epochDepthResolved,
     oldestPendingAgeMs: toNum(pick(queue, ['oldestPendingAgeMs', 'oldestAgeMs'], 0), 0),
     ingressRatePerSec: toNum(pick(queue, ['ingressRatePerSec', 'inRate'], 0), 0),
@@ -466,26 +489,7 @@ async function resolveQueue() {
 async function resolveProposals() {
   const leaderBase = await resolveLeaderUpstreamBase();
   const queue = await upstreamGetSnapshot('/v1/ops/snapshots/queue', '/v1/proposals/queue/stats', leaderBase);
-  const pendingStats = parsePendingEpochStats(pick(queue, ['pendingEpochStats'], ''));
-  const backpressureStats = parseBackpressureStats(pick(queue, ['backpressureStats'], ''));
-
-  const pendingCandidates = [
-    toNum(pick(queue, ['pendingCount', 'pending'], 0), 0),
-    toNum(pendingStats.pendingProposals, 0),
-  ];
-  const pendingResolved = Math.max(...pendingCandidates);
-  const mempoolResolved = toNum(
-    pick(queue, ['mempoolPendingCount', 'mempoolCount', 'mempool', 'mempoolSize', 'unverifiedQueueSize'], 0),
-    0,
-  );
-  const backpressurePending = Math.max(
-    toNum(pick(queue, ['backpressurePendingCount'], 0), 0),
-    toNum(backpressureStats.pending, 0),
-  );
-  const backpressureMax = Math.max(
-    toNum(pick(queue, ['backpressureMaxPending'], 0), 0),
-    toNum(backpressureStats.max, 0),
-  );
+  const signals = resolveQueueSignals(queue);
 
   const writeTotal = toNum(pick(queue, ['writeProposals'], 0), 0);
   const deleteTotal = toNum(pick(queue, ['deleteProposals'], 0), 0);
@@ -509,15 +513,14 @@ async function resolveProposals() {
 
   return {
     queuePressure: {
-      pending: pendingResolved,
-      mempool: mempoolResolved,
-      backpressurePending,
-      backpressureMax,
-      backpressureActive: Boolean(
-        pick(queue, ['backpressureActive'], false) || backpressureStats.active === true,
-      ),
-      backpressureSent: toNum(backpressureStats.sent, 0),
-      backpressureAcked: toNum(backpressureStats.acked, 0),
+      pending: signals.queuePending,
+      queuePending: signals.queuePending,
+      mempool: signals.mempool,
+      backpressurePending: signals.backpressurePending,
+      backpressureMax: signals.backpressureMax,
+      backpressureActive: signals.backpressureActive,
+      backpressureSent: signals.backpressureSent,
+      backpressureAcked: signals.backpressureAcked,
     },
     states: {
       unverified,
@@ -551,8 +554,8 @@ async function resolveProposals() {
       currentEpoch: toNum(pick(queue, ['currentEpoch'], 0), 0),
       finalizedEpoch: toNum(pick(queue, ['finalizedEpoch'], 0), 0),
       epochsUntilFinality: toNum(pick(queue, ['epochsUntilFinality'], 0), 0),
-      pendingEpochs: toNum(pendingStats.pendingEpochs, 0),
-      totalQueued: toNum(pendingStats.totalQueued, totalProposals),
+      pendingEpochs: signals.pendingEpochs,
+      totalQueued: signals.totalQueuedFromStats !== null ? signals.totalQueuedFromStats : totalProposals,
     },
   };
 }
@@ -678,22 +681,18 @@ async function resolveFinality() {
     upstreamGet('/v1/consensus/status'),
     upstreamGetSnapshot('/v1/ops/snapshots/queue', '/v1/proposals/queue/stats'),
   ]);
-  const pendingStats = parsePendingEpochStats(pick(queue, ['pendingEpochStats'], ''));
-  const pendingCandidates = [
-    toNum(pick(queue, ['pendingCount', 'pending'], 0), 0),
-    toNum(pick(queue, ['batchQueueSize'], 0), 0),
-    toNum(pick(queue, ['backpressurePendingCount'], 0), 0),
-    toNum(pendingStats.pendingProposals, 0),
-  ];
-  const pendingResolved = Math.max(...pendingCandidates);
+  const signals = resolveQueueSignals(queue);
   return {
     currentEpoch: toNum(pick(queue, ['currentEpoch'], pick(consensus, ['currentEpoch'], 0)), 0),
     ethereumEpoch: toNum(pick(consensus, ['ethereumEpoch'], 0), 0),
     finalizedEpoch: toNum(pick(queue, ['finalizedEpoch'], 0), 0),
     epochsUntilFinality: toNum(pick(queue, ['epochsUntilFinality'], 0), 0),
-    pendingProposals: pendingResolved,
-    pendingEpochs: toNum(pendingStats.pendingEpochs, 0),
-    totalQueued: toNum(pendingStats.totalQueued, toNum(pick(queue, ['totalProposals', 'writeProposals'], 0), 0)),
+    pendingProposals: signals.queuePending,
+    pendingEpochs: signals.pendingEpochs,
+    totalQueued: signals.totalQueuedFromStats !== null
+      ? signals.totalQueuedFromStats
+      : toNum(pick(queue, ['totalProposals', 'writeProposals'], 0), 0),
+    backpressurePending: signals.backpressurePending,
     totalFinalized: toNum(pick(queue, ['totalFinalizedCount'], 0), 0),
   };
 }
