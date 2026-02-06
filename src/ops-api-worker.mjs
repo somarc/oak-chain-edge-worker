@@ -302,6 +302,9 @@ async function resolveOverview() {
     pick(consensus, ['reachableValidators'], pick(cluster, ['reachableCount'], reachableNodes)),
     reachableNodes,
   );
+  const currentRole = String(
+    pick(cluster, ['role'], pick(consensus, ['currentRole'], pick(findLeader(nodes), ['role'], 'UNKNOWN'))),
+  ).toUpperCase();
   const status = reachableValidators > 0 ? 'healthy' : 'degraded';
   const signals = resolveQueueSignals(queue);
 
@@ -310,6 +313,7 @@ async function resolveOverview() {
     leader: {
       nodeId: toNum(leaderNodeId, 0),
       wallet: String(pick(consensus, ['leaderWallet', 'walletAddress'], pick(findLeader(nodes), ['walletAddress'], 'unknown'))),
+      role: currentRole,
       term: toNum(term, 0),
       since: pick(consensus, ['leaderSince', 'lastLeaderChangeAt'], nowIso()),
     },
@@ -317,6 +321,7 @@ async function resolveOverview() {
       nodeCount: Array.isArray(nodes) ? nodes.length : toNum(pick(consensus, ['clusterSize'], 0), 0),
       quorum: toNum(pick(cluster, ['quorumSize'], pick(cluster.quorum || {}, ['required'], 0)), 0),
       reachableNodes: reachableValidators,
+      role: currentRole,
     },
     queue: {
       pending: signals.queuePending,

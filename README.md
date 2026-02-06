@@ -8,6 +8,19 @@ Edge worker for Oak Chain operations APIs and dashboard integration.
 npm run start
 ```
 
+Process lifecycle scripts:
+
+```bash
+bin/start.sh
+bin/status.sh
+bin/restart.sh
+bin/stop.sh
+```
+
+Defaults align with mock validator lifecycle:
+- PID file: `~/oak-chain/pids/ops-proxy.pid`
+- Log file: `~/oak-chain/logs/start-ops-proxy.log`
+
 Default bind:
 - `OPS_MOCK_HOST=127.0.0.1`
 - `OPS_MOCK_PORT=8787`
