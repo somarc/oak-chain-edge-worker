@@ -90,6 +90,44 @@ function normalizeNodeIds(rawNodes) {
   });
 }
 
+function normalizeValidatorIdentities(payload) {
+  const validators = Array.isArray(pick(payload, ['validators'], []))
+    ? pick(payload, ['validators'], [])
+    : [];
+  const byPort = new Map();
+  const byNodeId = new Map();
+  const byMemberId = new Map();
+
+  validators.forEach((validator) => {
+    if (!validator || typeof validator !== 'object') return;
+    const port = parsePort(pick(validator, ['url'], null));
+    const nodeId = toNum(pick(validator, ['nodeId'], null), null);
+    const memberId = toNum(pick(validator, ['memberId'], null), null);
+    if (port !== null) byPort.set(port, validator);
+    if (Number.isFinite(nodeId) && nodeId >= 0) byNodeId.set(nodeId, validator);
+    if (Number.isFinite(memberId) && memberId >= 0) byMemberId.set(memberId, validator);
+  });
+
+  return { byPort, byNodeId, byMemberId };
+}
+
+function findValidatorIdentityForNode(node, identities) {
+  if (!identities) return null;
+  const port = toNum(pick(node, ['port'], parsePort(pick(node, ['url'], null))), null);
+  if (Number.isFinite(port) && identities.byPort.has(port)) {
+    return identities.byPort.get(port);
+  }
+  const nodeId = toNum(pick(node, ['nodeId'], null), null);
+  if (Number.isFinite(nodeId) && identities.byNodeId.has(nodeId)) {
+    return identities.byNodeId.get(nodeId);
+  }
+  const memberId = toNum(pick(node, ['memberId'], null), null);
+  if (Number.isFinite(memberId) && identities.byMemberId.has(memberId)) {
+    return identities.byMemberId.get(memberId);
+  }
+  return null;
+}
+
 function parsePendingEpochStats(statsText) {
   if (typeof statsText !== 'string') {
     return { pendingProposals: null, pendingEpochs: null, totalQueued: null };
@@ -416,7 +454,12 @@ function raftLike(cluster) {
 }
 
 async function resolveCluster() {
-  const cluster = await upstreamGetSnapshot('/v1/ops/snapshots/cluster', '/v1/aeron/cluster-state');
+  const leaderBase = await resolveLeaderUpstreamBase();
+  const [cluster, identitiesPayload] = await Promise.all([
+    upstreamGetSnapshot('/v1/ops/snapshots/cluster', '/v1/aeron/cluster-state', leaderBase),
+    upstreamGetFromBase('/v1/aeron/validator-identities', leaderBase).catch(() => ({ validators: [] })),
+  ]);
+  const identities = normalizeValidatorIdentities(identitiesPayload);
   const rawNodes = pick(cluster, ['nodes', 'members', 'validators'], []);
   const nodes = normalizeNodeIds(rawNodes);
   const leaderNode = nodes.find((n) => String(pick(n, ['role'], '')).toUpperCase() === 'LEADER');
@@ -424,17 +467,22 @@ async function resolveCluster() {
     clusterState: pick(cluster, ['clusterState', 'state'], pick(cluster.health || {}, ['status'], 'unknown')),
     term: toNum(pick(cluster, ['term', 'currentTerm'], 0), 0),
     leaderNodeId: toNum(pick(cluster, ['leaderNodeId', 'leader', 'leaderId'], leaderNode ? leaderNode.nodeId : 0), 0),
-    nodes: Array.isArray(nodes) ? nodes.map((node) => ({
+    nodes: Array.isArray(nodes) ? nodes.map((node) => {
+      const identity = findValidatorIdentityForNode(node, identities);
+      return ({
       nodeId: toNum(pick(node, ['nodeId'], 0), 0),
       displayId: toNum(pick(node, ['nodeId'], 0), 0),
-      wallet: String(pick(node, ['wallet', 'walletAddress'], 'unknown')),
+      wallet: String(
+        pick(identity, ['walletAddress', 'wallet'], pick(node, ['wallet', 'walletAddress'], 'unknown')),
+      ),
       url: String(pick(node, ['url'], '')),
       port: toNum(pick(node, ['port'], 0), 0),
       role: String(pick(node, ['role'], 'UNKNOWN')),
       status: String(pick(node, ['status'], 'unknown')),
       reachable: Boolean(pick(node, ['reachable', 'online'], true)),
       lastSeenAt: String(pick(node, ['lastSeenAt', 'lastHeartbeatAt'], nowIso())),
-    })) : [],
+      });
+    }) : [],
   };
 }
 
