@@ -1,0 +1,16 @@
+{
+  "name": "@somarc/oak-chain-edge-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Oak Chain edge worker for ops dashboard aggregation/proxy",
+  "scripts": {
+    "start": "node src/ops-api-worker.mjs",
+    "dev": "node src/ops-api-worker.mjs",
+    "check": "node --check src/ops-api-worker.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0"
+}
