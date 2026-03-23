@@ -7,6 +7,7 @@ OPS_MOCK_MODE="${OPS_MOCK_MODE:-proxy}"
 OPS_UPSTREAM_BASE="${OPS_UPSTREAM_BASE:-http://127.0.0.1:8090}"
 OPS_MOCK_HOST="${OPS_MOCK_HOST:-127.0.0.1}"
 OPS_MOCK_PORT="${OPS_MOCK_PORT:-8787}"
+OPS_PROXY_ENV_FILE="${OPS_PROXY_ENV_FILE:-$HOME/oak-chain/ops-proxy.env}"
 
 PID_DIR="${PID_DIR:-$HOME/oak-chain/pids}"
 LOG_DIR="${LOG_DIR:-$HOME/oak-chain/logs}"
@@ -14,6 +15,15 @@ PID_FILE="${PID_FILE:-$PID_DIR/ops-proxy.pid}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/start-ops-proxy.log}"
 
 mkdir -p "$PID_DIR" "$LOG_DIR"
+
+load_env_file() {
+  if [ -f "$OPS_PROXY_ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$OPS_PROXY_ENV_FILE"
+  fi
+}
+
+load_env_file
 
 is_pid_alive() {
   local pid="${1:-}"
