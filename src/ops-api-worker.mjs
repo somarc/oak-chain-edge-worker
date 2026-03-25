@@ -48,7 +48,10 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/gc/status': 'gc.status.v1',
   '/v1/gc/estimate': 'gc.estimate.v1',
   '/v1/compaction/proposals': 'gc.compaction.proposals.v1',
+  '/v1/explorer/proposals/{proposalId}': 'explorer.v1',
+  '/v1/explorer/wallets/{walletAddress}': 'explorer.v1',
   '/v1/fragmentation/metrics': 'fragmentation.metrics.v1',
+  '/v1/fragmentation/metrics/{walletAddress}': 'fragmentation.metrics.entity.v1',
   '/v1/fragmentation/top': 'fragmentation.top.v1',
 });
 const FORBIDDEN_UPSTREAM_PREFIXES = Object.freeze([
@@ -311,6 +314,27 @@ function shortWallet(wallet) {
   return `${wallet.slice(0, 10)}...${wallet.slice(-8)}`;
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sourceContractSpecForPath(path) {
+  const normalized = normalizeSourcePath(path);
+  if (Object.prototype.hasOwnProperty.call(SOURCE_CONTRACT_VERSIONS, normalized)) {
+    return { normalized, template: normalized, contractVersion: SOURCE_CONTRACT_VERSIONS[normalized] };
+  }
+
+  for (const [template, contractVersion] of Object.entries(SOURCE_CONTRACT_VERSIONS)) {
+    if (!template.includes('{')) continue;
+    const pattern = `^${escapeRegExp(template).replace(/\\\{[^}]+\\\}/g, '[^/]+')}$`;
+    if (new RegExp(pattern).test(normalized)) {
+      return { normalized, template, contractVersion };
+    }
+  }
+
+  return null;
+}
+
 async function upstreamGet(path) {
   return upstreamGetSource(path);
 }
@@ -324,7 +348,7 @@ function assertAllowedUpstreamPath(path) {
   if (FORBIDDEN_UPSTREAM_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
     throw new Error(`upstream path ${normalized} is not allowed for canonical /ops/v1/* composition`);
   }
-  if (!Object.prototype.hasOwnProperty.call(SOURCE_CONTRACT_VERSIONS, normalized)) {
+  if (!sourceContractSpecForPath(normalized)) {
     throw new Error(`upstream path ${normalized} is not a governed source contract`);
   }
   return normalized;
@@ -332,7 +356,8 @@ function assertAllowedUpstreamPath(path) {
 
 function validateSourceContract(path, payload) {
   const normalized = normalizeSourcePath(path);
-  const expected = SOURCE_CONTRACT_VERSIONS[normalized];
+  const spec = sourceContractSpecForPath(normalized);
+  const expected = spec ? spec.contractVersion : null;
   const actual = pick(payload, ['contractVersion'], null);
   if (!expected) {
     return payload;
@@ -631,6 +656,24 @@ async function resolveHeader() {
 }
 async function resolveExplorerSummary() {
   return upstreamGetUnwrapped('/v1/explorer/summary');
+}
+
+async function resolveExplorerProposal(proposalId, leaderBase = UPSTREAM_BASE) {
+  return upstreamGetUnwrapped(`/v1/explorer/proposals/${encodeURIComponent(proposalId)}`, leaderBase);
+}
+
+async function resolveExplorerWallet(walletAddress, leaderBase = UPSTREAM_BASE) {
+  return upstreamGetUnwrapped(`/v1/explorer/wallets/${encodeURIComponent(walletAddress)}`, leaderBase);
+}
+
+async function resolveFragmentationMetricsByWallet(walletAddress, leaderBase = UPSTREAM_BASE) {
+  return upstreamGetUnwrapped(`/v1/fragmentation/metrics/${encodeURIComponent(walletAddress)}`, leaderBase);
+}
+
+async function resolveFragmentationTop(url, leaderBase = UPSTREAM_BASE) {
+  const requestedLimit = Number(url?.searchParams?.get('limit') || 10);
+  const limit = Math.max(1, Math.min(Number.isFinite(requestedLimit) ? requestedLimit : 10, 100));
+  return upstreamGetUnwrapped(`/v1/fragmentation/top?limit=${limit}`, leaderBase);
 }
 
 function findLeader(nodes) {
@@ -941,6 +984,91 @@ function staticProposalReleaseFlow() {
       replacementEndpoint: '/ops/v1/proposals/release-flow',
     },
     note: 'Adaptive release view shown with epoch compatibility metadata for operators still tracking finality cadence.',
+  };
+}
+
+function staticExplorerProposalDetail(proposalId) {
+  return {
+    contractVersion: 'explorer.v1',
+    generatedAtMs: Date.now(),
+    proposalId,
+    state: 'PENDING',
+    ethereumTxHash: null,
+    timeoutTimestamp: null,
+    confirmedBlock: null,
+    rejectionReason: null,
+    durabilityState: 'UNKNOWN',
+    durabilityTimestamp: null,
+    durabilityError: null,
+    durableHead: null,
+  };
+}
+
+function staticExplorerWalletDetail(walletAddress) {
+  return {
+    contractVersion: 'explorer.v1',
+    generatedAtMs: Date.now(),
+    wallet: walletAddress,
+    walletPath: `/oak-chain/00/00/00/${walletAddress}`,
+    meta: {
+      contentCount: 0,
+      totalWrites: 0,
+      walletCreated: Date.now(),
+      lastWrite: Date.now(),
+      nodeType: 'WALLET',
+    },
+    recentContent: [],
+  };
+}
+
+function staticFragmentationEntityMetrics(walletAddress) {
+  return {
+    contractVersion: 'fragmentation.metrics.entity.v1',
+    walletAddress,
+    data: {
+      walletAddress,
+      tarFilesCreated: 0,
+      totalBytesWritten: 0,
+      totalBytesWrittenFormatted: '0 B',
+      averageTarFileSize: 0,
+      averageTarFileSizeFormatted: '0 B',
+      packingEfficiency: '0.00',
+      smallTarFileCount: 0,
+      fragmentationScore: 0,
+      fragmentationTax: '0',
+      fragmentationTaxFormatted: '0.0 ETH',
+      lastWriteTimestamp: null,
+      tarFiles: [],
+    },
+  };
+}
+
+function staticFragmentationTop(limit) {
+  const cappedLimit = Math.max(1, Math.min(Number.isFinite(limit) ? limit : 10, 100));
+  const sampleEntities = [
+    '0x1111111111111111111111111111111111111111',
+    '0x2222222222222222222222222222222222222222',
+    '0x3333333333333333333333333333333333333333',
+  ].slice(0, Math.min(cappedLimit, 3)).map((walletAddress, index) => ({
+    walletAddress,
+    tarFilesCreated: 12 - index,
+    totalBytesWritten: 1048576 * (index + 1),
+    totalBytesWrittenFormatted: formatBytes(1048576 * (index + 1)),
+    averageTarFileSize: 524288 * (index + 1),
+    averageTarFileSizeFormatted: formatBytes(524288 * (index + 1)),
+    packingEfficiency: String((37.5 + (index * 7.5)).toFixed(2)),
+    smallTarFileCount: index,
+    fragmentationScore: 80 - (index * 10),
+    fragmentationTax: String(2500 + (index * 500)),
+    fragmentationTaxFormatted: `${2.5 + (index * 0.5)} ETH`,
+    lastWriteTimestamp: nowIso(),
+    tarFiles: [`data0000${index}a.tar`],
+  }));
+
+  return {
+    contractVersion: 'fragmentation.top.v1',
+    limit: cappedLimit,
+    entities: sampleEntities,
   };
 }
 
@@ -1708,6 +1836,18 @@ function handle(req, res) {
     return;
   }
 
+  if (path.startsWith('/ops/v1/explorer/proposal/') && MODE === 'static') {
+    const proposalId = decodeURIComponent(path.substring('/ops/v1/explorer/proposal/'.length));
+    sendJson(res, 200, envelope(staticExplorerProposalDetail(proposalId)));
+    return;
+  }
+
+  if (path.startsWith('/ops/v1/explorer/wallets/') && MODE === 'static') {
+    const walletAddress = decodeURIComponent(path.substring('/ops/v1/explorer/wallets/'.length));
+    sendJson(res, 200, envelope(staticExplorerWalletDetail(walletAddress)));
+    return;
+  }
+
   if (path === '/ops/v1/cluster' && MODE === 'static') {
     sendJson(res, 200, envelope({
       clusterState: 'ACTIVE',
@@ -2196,6 +2336,17 @@ function handle(req, res) {
     return;
   }
 
+  if (path.startsWith('/ops/v1/fragmentation/metrics/') && MODE === 'static') {
+    const walletAddress = decodeURIComponent(path.substring('/ops/v1/fragmentation/metrics/'.length));
+    sendJson(res, 200, envelope(staticFragmentationEntityMetrics(walletAddress)));
+    return;
+  }
+
+  if (path === '/ops/v1/fragmentation/top' && MODE === 'static') {
+    sendJson(res, 200, envelope(staticFragmentationTop(Number(url.searchParams.get('limit') || 10))));
+    return;
+  }
+
   if (path.startsWith('/ops/v1/transactions/') && MODE === 'static') {
     const transactionId = path.substring('/ops/v1/transactions/'.length);
     sendJson(res, 200, envelope({
@@ -2226,6 +2377,16 @@ function handle(req, res) {
       }
       if (path === '/ops/v1/explorer/summary') {
         sendJson(res, 200, envelope(await resolveExplorerSummary()));
+        return;
+      }
+      if (path.startsWith('/ops/v1/explorer/proposal/')) {
+        const proposalId = decodeURIComponent(path.substring('/ops/v1/explorer/proposal/'.length));
+        sendJson(res, 200, envelope(await resolveExplorerProposal(proposalId)));
+        return;
+      }
+      if (path.startsWith('/ops/v1/explorer/wallets/')) {
+        const walletAddress = decodeURIComponent(path.substring('/ops/v1/explorer/wallets/'.length));
+        sendJson(res, 200, envelope(await resolveExplorerWallet(walletAddress)));
         return;
       }
       if (path === '/ops/v1/cluster') {
@@ -2342,6 +2503,15 @@ function handle(req, res) {
       }
       if (path === '/ops/v1/fragmentation/metrics') {
         sendJson(res, 200, envelope(await upstreamGetUnwrapped('/v1/fragmentation/metrics')));
+        return;
+      }
+      if (path.startsWith('/ops/v1/fragmentation/metrics/')) {
+        const walletAddress = decodeURIComponent(path.substring('/ops/v1/fragmentation/metrics/'.length));
+        sendJson(res, 200, envelope(await resolveFragmentationMetricsByWallet(walletAddress)));
+        return;
+      }
+      if (path === '/ops/v1/fragmentation/top') {
+        sendJson(res, 200, envelope(await resolveFragmentationTop(url)));
         return;
       }
       if (path === '/ops/v1/finality') {
