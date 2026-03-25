@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/ops-api-worker.mjs",
     "dev": "node src/ops-api-worker.mjs",
-    "check": "node --check src/ops-api-worker.mjs"
+    "check": "node --check src/ops-api-worker.mjs && node scripts/check-governed-sources.mjs"
   },
   "engines": {
     "node": ">=20"
