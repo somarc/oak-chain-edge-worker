@@ -384,6 +384,15 @@ async function resolveClusterQueueSnapshot(leaderBase) {
 
 async function resolveLeaderUpstreamBase() {
   try {
+    const leader = await upstreamGet('/v1/consensus/leader');
+    const directLeader = pick(leader, ['currentLeader'], null);
+    if (typeof directLeader === 'string' && directLeader.length > 0) {
+      return directLeader.replace(/\/$/, '');
+    }
+  } catch (_e) {
+    // Fall through to legacy endpoints.
+  }
+  try {
     const consensus = await upstreamGet('/v1/consensus/status');
     const currentLeader = pick(consensus, ['currentLeader'], null);
     if (typeof currentLeader === 'string' && currentLeader.length > 0) {
