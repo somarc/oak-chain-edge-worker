@@ -35,7 +35,34 @@ Upstream target (proxy mode):
 curl http://127.0.0.1:8787/ops/v1/overview
 ```
 
-## Deployment Note
+## Cloudflare Deploy
 
-Current mode is local process orchestration (validator lifecycle scripts).
-Target hosting can move to Adobe I/O Runtime once auth/network/runtime constraints are finalized.
+Static worker redeploy:
+
+```bash
+bin/deploy-cloudflare.sh
+```
+
+Proxy worker redeploy against a temporary ngrok tunnel:
+
+```bash
+bin/deploy-cloudflare.sh https://abc123.ngrok-free.app
+```
+
+Reuse the same upstream already stored in `~/oak-chain/ops-proxy.env`:
+
+```bash
+bin/deploy-cloudflare.sh --from-local-env
+```
+
+NPM wrapper:
+
+```bash
+npm run deploy:quick -- https://abc123.ngrok-free.app
+```
+
+If the tunneled upstream requires bearer auth, pass it at deploy time:
+
+```bash
+bin/deploy-cloudflare.sh https://abc123.ngrok-free.app --upstream-auth "$OPS_UPSTREAM_AUTH_TOKEN"
+```

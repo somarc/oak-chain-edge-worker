@@ -1,21 +1,38 @@
 #!/usr/bin/env node
 
-import http from 'node:http';
-import { URL } from 'node:url';
+import { ExplorerNamespaceCache, walletPathFromAddress } from './explorer-cache.mjs';
 
-const PORT = Number(process.env.OPS_MOCK_PORT || 8787);
-const HOST = process.env.OPS_MOCK_HOST || '127.0.0.1';
-const CLUSTER_ID = process.env.OPS_MOCK_CLUSTER_ID || 'oak-local-a';
-const MODE = process.env.OPS_MOCK_MODE || 'static';
-const UPSTREAM_BASE = (process.env.OPS_UPSTREAM_BASE || 'http://127.0.0.1:8090').replace(/\/$/, '');
-const UPSTREAM_CACHE_TTL_MS = Number(process.env.OPS_UPSTREAM_CACHE_TTL_MS || 10000);
+const BOOT_ENV = globalThis.OAK_EDGE_WORKER_BOOT_ENV || {};
+const PROCESS_ENV = typeof process !== 'undefined' && process?.env ? process.env : null;
+const ENV = PROCESS_ENV || BOOT_ENV;
+
+function readEnv(name, fallback = '') {
+  const raw = ENV[name];
+  if (raw === undefined || raw === null) return fallback;
+  const trimmed = String(raw).trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+const PORT = Number(readEnv('OPS_MOCK_PORT', 8787));
+const HOST = readEnv('OPS_MOCK_HOST', '127.0.0.1');
+const CLUSTER_ID = readEnv('OPS_MOCK_CLUSTER_ID', 'oak-local-a');
+const MODE = readEnv('OPS_MOCK_MODE', 'static');
+const UPSTREAM_BASE = readEnv('OPS_UPSTREAM_BASE', 'http://127.0.0.1:8090').replace(/\/$/, '');
+const UPSTREAM_CACHE_TTL_MS = Number(readEnv('OPS_UPSTREAM_CACHE_TTL_MS', 10000));
 const UPSTREAM_CACHE = new Map();
 const CHAIN_MODE =
-  process.env.OPS_CHAIN_MODE
-  || process.env.OAK_BLOCKCHAIN_MODE
-  || process.env.OAK_CHAIN_MODE
-  || process.env.BLOCKCHAIN_MODE
+  readEnv('OPS_CHAIN_MODE')
+  || readEnv('OAK_BLOCKCHAIN_MODE')
+  || readEnv('OAK_CHAIN_MODE')
+  || readEnv('BLOCKCHAIN_MODE')
   || 'mock';
+const EXPLORER_REMOTE_CACHE_TTL_MS = Number(readEnv(
+  'OPS_EXPLORER_REMOTE_CACHE_TTL_MS',
+  24 * 60 * 60 * 1000,
+));
+const EXPLORER_LOCAL_FALLBACK_TTL_MS = Number(
+  readEnv('OPS_EXPLORER_LOCAL_FALLBACK_TTL_MS', UPSTREAM_CACHE_TTL_MS),
+);
 const OPS_API_AUTH_TOKEN = readStringEnv(['OPS_API_AUTH_TOKEN', 'OAK_OPS_API_AUTH_TOKEN'], '');
 const OPS_RUNTIME_AUTH_TOKEN = readStringEnv(
   ['OPS_RUNTIME_AUTH_TOKEN', 'OAK_OPS_RUNTIME_AUTH_TOKEN'],
@@ -26,6 +43,7 @@ const OPS_UPSTREAM_AUTH_TOKEN = readStringEnv(
   '',
 );
 const SOURCE_CONTRACT_VERSIONS = Object.freeze({
+  '/v1/index': 'index.v1',
   '/v1/consensus/leader': 'consensus.leader.v1',
   '/v1/consensus/status': 'consensus.status.v1',
   '/v1/ops/snapshots/health': 'ops.v1',
@@ -37,6 +55,10 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/proposals/release-flow': 'release-flow.v1',
   '/v1/proposals/epochs': 'proposal.epoch-overlay.v1',
   '/v1/explorer/summary': 'explorer.v1',
+  '/v1/explorer/content/nav': 'explorer.content.v1',
+  '/v1/explorer/content/clusters/{clusterId}/tree': 'explorer.content.v1',
+  '/v1/explorer/content/clusters/{clusterId}/node': 'explorer.content.v1',
+  '/v1/explorer/content/clusters/{clusterId}/provenance': 'explorer.content.v1',
   '/v1/events/recent': 'events.recent.v1',
   '/v1/events/stats': 'events.stats.v1',
   '/v1/config/osgi': 'config.osgi.v1',
@@ -54,6 +76,17 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/fragmentation/metrics/{walletAddress}': 'fragmentation.metrics.entity.v1',
   '/v1/fragmentation/top': 'fragmentation.top.v1',
 });
+const EXPLORER_CACHE = new ExplorerNamespaceCache({
+  chainMode: CHAIN_MODE,
+  remoteTtlMs: EXPLORER_REMOTE_CACHE_TTL_MS,
+  localFallbackTtlMs: EXPLORER_LOCAL_FALLBACK_TTL_MS,
+});
+const EXPLORER_INVALIDATION_TYPES = 'content,binary,delete,wallet,consensus';
+const EXPLORER_INVALIDATION_PATH = '/oak-chain';
+const EXPLORER_INVALIDATION_POLL_MS = 30000;
+let explorerInvalidationStarted = false;
+let explorerInvalidationPollTimer = null;
+let explorerInvalidationSinceMs = 0;
 const FORBIDDEN_UPSTREAM_PREFIXES = Object.freeze([
   '/v1/aeron/',
   '/api/',
@@ -66,7 +99,7 @@ const FORBIDDEN_UPSTREAM_PREFIXES = Object.freeze([
 
 function readStringEnv(names, fallback = '') {
   for (const name of names) {
-    const raw = process.env[name];
+    const raw = ENV[name];
     if (raw === undefined || raw === null) continue;
     const trimmed = String(raw).trim();
     if (trimmed.length > 0) return trimmed;
@@ -376,6 +409,153 @@ function buildUpstreamHeaders() {
   return headers;
 }
 
+function explorerCacheEnabled() {
+  return EXPLORER_CACHE.isEnabled();
+}
+
+function normalizeInvalidationEvent(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
+  return {
+    type: pick(data, ['legacyType', 'type'], pick(payload, ['eventType'], null)),
+    action: pick(data, ['legacyAction', 'action'], null),
+    path: pick(data, ['path'], null),
+    wallet: pick(data, ['wallet'], null),
+    timestampMs: toNum(pick(payload, ['timestampMs'], pick(data, ['timestamp'], Date.now())), Date.now()),
+  };
+}
+
+function noteExplorerInvalidationEvent(payload) {
+  const event = normalizeInvalidationEvent(payload);
+  if (!event) return;
+  EXPLORER_CACHE.invalidateByEvent(event);
+  EXPLORER_CACHE.noteInvalidationSuccess(event.timestampMs || Date.now());
+  explorerInvalidationSinceMs = Math.max(explorerInvalidationSinceMs, toNum(event.timestampMs, 0));
+}
+
+async function pollExplorerInvalidations() {
+  if (!explorerCacheEnabled()) {
+    return;
+  }
+  const params = new URLSearchParams();
+  params.set('limit', '100');
+  params.set('types', EXPLORER_INVALIDATION_TYPES);
+  params.set('path', EXPLORER_INVALIDATION_PATH);
+  if (explorerInvalidationSinceMs > 0) {
+    params.set('since', String(explorerInvalidationSinceMs));
+  }
+
+  const payload = await fetchUpstreamJson(`/v1/events/recent?${params.toString()}`);
+  const unwrapped = payload && typeof payload === 'object' && payload.data && typeof payload.data === 'object'
+    ? payload.data
+    : payload;
+  const events = Array.isArray(pick(unwrapped, ['events'], [])) ? pick(unwrapped, ['events'], []) : [];
+  events.forEach((event) => noteExplorerInvalidationEvent(event));
+  EXPLORER_CACHE.noteInvalidationSuccess(Date.now());
+}
+
+async function consumeExplorerInvalidationStream() {
+  if (!explorerCacheEnabled()) {
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set('types', EXPLORER_INVALIDATION_TYPES);
+  params.set('path', EXPLORER_INVALIDATION_PATH);
+  if (explorerInvalidationSinceMs > 0) {
+    params.set('since', String(explorerInvalidationSinceMs));
+  }
+
+  const target = `${UPSTREAM_BASE}/v1/ops/events/stream?${params.toString()}`;
+  const response = await fetch(target, {
+    headers: {
+      ...buildUpstreamHeaders(),
+      accept: 'text/event-stream',
+    },
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`explorer invalidation stream HTTP ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let dataLines = [];
+
+  const dispatch = () => {
+    if (!dataLines.length) {
+      return;
+    }
+    const payload = parseJsonSafe(dataLines.join('\n'), null);
+    dataLines = [];
+    if (payload) {
+      noteExplorerInvalidationEvent(payload);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      dispatch();
+      return;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line) {
+        dispatch();
+        continue;
+      }
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trim());
+      }
+    }
+  }
+}
+
+function ensureExplorerInvalidationLoop() {
+  if (!explorerCacheEnabled() || explorerInvalidationStarted) {
+    return;
+  }
+  explorerInvalidationStarted = true;
+
+  const streamLoop = async () => {
+    while (explorerCacheEnabled()) {
+      try {
+        await consumeExplorerInvalidationStream();
+      } catch (_error) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    }
+  };
+  streamLoop();
+
+  pollExplorerInvalidations().catch(() => {});
+  explorerInvalidationPollTimer = setInterval(() => {
+    pollExplorerInvalidations().catch(() => {});
+  }, EXPLORER_INVALIDATION_POLL_MS);
+  if (typeof explorerInvalidationPollTimer?.unref === 'function') {
+    explorerInvalidationPollTimer.unref();
+  }
+}
+
+async function resolveCachedExplorerValue(cacheKey, loader, classify) {
+  ensureExplorerInvalidationLoop();
+  const cached = EXPLORER_CACHE.get({ cacheKey });
+  if (cached) {
+    return cached;
+  }
+  const data = await loader();
+  const spec = classify ? classify(data) : null;
+  if (spec) {
+    EXPLORER_CACHE.put({ cacheKey, ...spec }, data);
+  }
+  return data;
+}
+
 async function fetchUpstreamJson(path, baseUrl = UPSTREAM_BASE) {
   const normalized = assertAllowedUpstreamPath(path);
   const base = (baseUrl || UPSTREAM_BASE).replace(/\/$/, '');
@@ -658,12 +838,82 @@ async function resolveExplorerSummary() {
   return upstreamGetUnwrapped('/v1/explorer/summary');
 }
 
+async function resolveExplorerIndex() {
+  const payload = await upstreamGetUnwrapped('/v1/index');
+  const endpoints = Array.isArray(pick(payload, ['endpoints'], [])) ? pick(payload, ['endpoints'], []) : [];
+  const governedGets = endpoints.filter((endpoint) => {
+    const method = String(pick(endpoint, ['method'], '')).toUpperCase();
+    return pick(endpoint, ['surfaceClass'], '') === 'source' && method.includes('GET');
+  });
+
+  return {
+    contractVersion: 'ops.index.v1',
+    generatedAtMs: Date.now(),
+    surfaceRole: 'edge-governed',
+    preferredBrowserContract: '/ops/v1/*',
+    derivedFrom: '/v1/index',
+    count: governedGets.length,
+    endpoints: governedGets,
+  };
+}
+
 async function resolveExplorerProposal(proposalId, leaderBase = UPSTREAM_BASE) {
   return upstreamGetUnwrapped(`/v1/explorer/proposals/${encodeURIComponent(proposalId)}`, leaderBase);
 }
 
 async function resolveExplorerWallet(walletAddress, leaderBase = UPSTREAM_BASE) {
-  return upstreamGetUnwrapped(`/v1/explorer/wallets/${encodeURIComponent(walletAddress)}`, leaderBase);
+  const normalizedWallet = String(walletAddress || '').toLowerCase();
+  return resolveCachedExplorerValue(
+    `wallet:${normalizedWallet}`,
+    () => upstreamGetUnwrapped(`/v1/explorer/wallets/${encodeURIComponent(walletAddress)}`, leaderBase),
+    (payload) => ({
+      namespace: pick(payload, ['walletPath'], walletPathFromAddress(normalizedWallet) || '/oak-chain'),
+      scope: String(pick(pick(payload, ['authority'], {}), ['scope'], 'local')).toLowerCase() === 'remote' ? 'remote' : 'local',
+    }),
+  );
+}
+
+async function resolveExplorerContentNav() {
+  return upstreamGetUnwrapped('/v1/explorer/content/nav');
+}
+
+function explorerContentCacheSpec(payload, fallbackPath = '/oak-chain') {
+  return {
+    namespace: pick(payload, ['namespace'], fallbackPath),
+    scope: String(pick(pick(payload, ['authority'], {}), ['scope'], pick(pick(payload, ['cluster'], {}), ['scope'], 'local'))).toLowerCase() === 'remote'
+      ? 'remote'
+      : 'local',
+  };
+}
+
+async function resolveExplorerContentTree(clusterId, logicalPath = '/oak-chain') {
+  const cacheKey = `content-tree:${clusterId}:${logicalPath}`;
+  const query = new URLSearchParams({ path: logicalPath });
+  return resolveCachedExplorerValue(
+    cacheKey,
+    () => upstreamGetUnwrapped(`/v1/explorer/content/clusters/${encodeURIComponent(clusterId)}/tree?${query.toString()}`),
+    (payload) => explorerContentCacheSpec(payload, logicalPath),
+  );
+}
+
+async function resolveExplorerContentNode(clusterId, logicalPath = '/oak-chain') {
+  const cacheKey = `content-node:${clusterId}:${logicalPath}`;
+  const query = new URLSearchParams({ path: logicalPath });
+  return resolveCachedExplorerValue(
+    cacheKey,
+    () => upstreamGetUnwrapped(`/v1/explorer/content/clusters/${encodeURIComponent(clusterId)}/node?${query.toString()}`),
+    (payload) => explorerContentCacheSpec(payload, logicalPath),
+  );
+}
+
+async function resolveExplorerContentProvenance(clusterId, logicalPath = '/oak-chain') {
+  const cacheKey = `content-provenance:${clusterId}:${logicalPath}`;
+  const query = new URLSearchParams({ path: logicalPath });
+  return resolveCachedExplorerValue(
+    cacheKey,
+    () => upstreamGetUnwrapped(`/v1/explorer/content/clusters/${encodeURIComponent(clusterId)}/provenance?${query.toString()}`),
+    (payload) => explorerContentCacheSpec(payload, logicalPath),
+  );
 }
 
 async function resolveFragmentationMetricsByWallet(walletAddress, leaderBase = UPSTREAM_BASE) {
@@ -1010,6 +1260,14 @@ function staticExplorerWalletDetail(walletAddress) {
     generatedAtMs: Date.now(),
     wallet: walletAddress,
     walletPath: `/oak-chain/00/00/00/${walletAddress}`,
+    authority: {
+      wallet: walletAddress,
+      ownership: 'local',
+      l1Prefix: '00',
+      scope: 'local',
+      readOnly: false,
+      redirectUrl: null,
+    },
     meta: {
       contentCount: 0,
       totalWrites: 0,
@@ -1018,6 +1276,161 @@ function staticExplorerWalletDetail(walletAddress) {
       nodeType: 'WALLET',
     },
     recentContent: [],
+  };
+}
+
+function staticExplorerIndex() {
+  return {
+    contractVersion: 'ops.index.v1',
+    generatedAtMs: Date.now(),
+    surfaceRole: 'edge-governed',
+    preferredBrowserContract: '/ops/v1/*',
+    derivedFrom: '/v1/index',
+    count: 8,
+    endpoints: [
+      { method: 'GET', path: '/v1/explorer/summary', category: 'Explorer', description: 'Explorer summary contract', surfaceClass: 'source', replacement: '/ops/v1/explorer/summary' },
+      { method: 'GET', path: '/v1/explorer/proposals/{proposalId}', category: 'Explorer', description: 'Explorer proposal detail', surfaceClass: 'source', replacement: '/ops/v1/explorer/proposals/{proposalId}' },
+      { method: 'GET', path: '/v1/explorer/wallets/{walletAddress}', category: 'Explorer', description: 'Explorer wallet detail', surfaceClass: 'source', replacement: '/ops/v1/explorer/wallets/{walletAddress}' },
+      { method: 'GET', path: '/v1/explorer/content/nav', category: 'Explorer', description: 'Cluster-aware content explorer navigation', surfaceClass: 'source', replacement: '/ops/v1/explorer/content/nav' },
+      { method: 'GET', path: '/v1/explorer/content/clusters/{clusterId}/tree', category: 'Explorer', description: 'Cluster-scoped content tree browse', surfaceClass: 'source', replacement: '/ops/v1/explorer/content/clusters/{clusterId}/tree' },
+      { method: 'GET', path: '/v1/explorer/content/clusters/{clusterId}/node', category: 'Explorer', description: 'Cluster-scoped node detail', surfaceClass: 'source', replacement: '/ops/v1/explorer/content/clusters/{clusterId}/node' },
+      { method: 'GET', path: '/v1/explorer/content/clusters/{clusterId}/provenance', category: 'Explorer', description: 'Cluster-scoped provenance and authority facts', surfaceClass: 'source', replacement: '/ops/v1/explorer/content/clusters/{clusterId}/provenance' },
+      { method: 'GET', path: '/v1/config/osgi', category: 'Configuration', description: 'Effective OSGi config values', surfaceClass: 'source', replacement: '/ops/v1/config/osgi' },
+    ],
+  };
+}
+
+function staticExplorerContentNav() {
+  return {
+    contractVersion: 'explorer.content.v1',
+    generatedAtMs: Date.now(),
+    topologyModel: 'Aeron fiefdoms + lazy read fabric',
+    networkStatus: 'observable',
+    localCluster: {
+      clusterId: CLUSTER_ID,
+      displayName: 'Local Aeron fiefdom',
+      scope: 'local',
+      readOnly: false,
+      authoritative: true,
+      roleLabel: 'Authoritative local write scope',
+      ownedPrefixes: '00-7f',
+      status: 'ACTIVE',
+      transport: 'Aeron consensus',
+      note: 'Local wallets write here; foreign wallets redirect before queueing.',
+      browseRoot: '/oak-chain',
+      nodeCount: 3,
+      leaderLabel: 'Node 1 leads',
+      roots: [{ label: 'Local Aeron fiefdom', path: '/oak-chain', namespace: '/oak-chain', readOnly: false, ownedPrefixes: '00-7f' }],
+    },
+    mountedNeighbors: [
+      {
+        clusterId: 'remote-oak-local-b',
+        displayName: 'Remote oak-local-b',
+        scope: 'remote',
+        readOnly: true,
+        authoritative: false,
+        roleLabel: 'Lazy read-only remote cluster',
+        relation: 'Lazy read-only remote cluster',
+        ownedPrefixes: '80-ff',
+        status: 'visible',
+        transport: 'HTTP segment transfer',
+        note: 'Remote cluster remains outside local consensus and is visible through read-only mounts.',
+        browseRoot: '/oak-chain',
+        roots: [{ label: 'Remote oak-local-b', path: '/oak-chain', namespace: '/oak-chain/80', readOnly: true, ownedPrefixes: '80-ff' }],
+      },
+    ],
+    outerNetwork: {
+      label: 'Oak Chain beyond the local mount horizon',
+      status: 'observable',
+      summary: 'Independent Aeron fiefdoms can be read across a lazy fabric without collapsing into one consensus domain.',
+      discoveryPlane: 'Separate control plane',
+      readFabric: 'Lazy read-only mounts over HTTP segment transfer',
+      writeAuthority: 'Each cluster writes only its owned prefixes.',
+      observedClusterCount: 2,
+      mountedClusterCount: 1,
+      principles: [
+        'Aeron governs the local writable repository only.',
+        'Cross-cluster reads are lazy and read-only.',
+        'Discovery stays separate from consensus.',
+      ],
+    },
+    cacheHints: {
+      local: { strategy: 'event-invalidated', fallbackTtlMs: EXPLORER_LOCAL_FALLBACK_TTL_MS },
+      remote: { strategy: 'ttl', ttlMs: EXPLORER_REMOTE_CACHE_TTL_MS },
+    },
+  };
+}
+
+function staticExplorerContentTree(clusterId, logicalPath = '/oak-chain') {
+  const scope = clusterId === CLUSTER_ID ? 'local' : 'remote';
+  const namespace = scope === 'local' ? '/oak-chain' : '/oak-chain/80';
+  return {
+    contractVersion: 'explorer.content.v1',
+    generatedAtMs: Date.now(),
+    cluster: {
+      clusterId,
+      displayName: scope === 'local' ? 'Local Aeron fiefdom' : 'Remote oak-local-b',
+      scope,
+      readOnly: scope === 'remote',
+      authoritative: scope === 'local',
+      ownedPrefixes: scope === 'local' ? '00-7f' : '80-ff',
+      browseRoot: '/oak-chain',
+    },
+    authority: {
+      clusterId,
+      scope,
+      readOnly: scope === 'remote',
+      authoritative: scope === 'local',
+      namespace,
+      browseRoot: '/oak-chain',
+      ownedPrefixes: scope === 'local' ? '00-7f' : '80-ff',
+    },
+    breadcrumbs: [{ label: 'oak-chain', path: '/oak-chain' }],
+    path: logicalPath,
+    namespace,
+    exists: true,
+    node: {
+      name: logicalPath === '/oak-chain' ? 'oak-chain' : logicalPath.split('/').pop(),
+      path: logicalPath,
+      primaryType: 'nt:unstructured',
+      childCount: 1,
+      propertyCount: 1,
+      hasChildren: true,
+    },
+    children: scope === 'local'
+      ? [{ name: '12', path: '/oak-chain/12', primaryType: 'nt:unstructured', childCount: 1, propertyCount: 1, hasChildren: true }]
+      : [{ name: '80', path: '/oak-chain/80', primaryType: 'nt:unstructured', childCount: 1, propertyCount: 1, hasChildren: true }],
+  };
+}
+
+function staticExplorerContentNode(clusterId, logicalPath = '/oak-chain') {
+  const tree = staticExplorerContentTree(clusterId, logicalPath);
+  return {
+    ...tree,
+    properties: [
+      { name: 'jcr:primaryType', type: 'STRING', multiValued: false, value: 'nt:unstructured' },
+      { name: 'message', type: 'STRING', multiValued: false, value: tree.cluster.scope === 'local' ? 'local seed' : 'remote seed' },
+    ],
+    childrenPreview: tree.children,
+  };
+}
+
+function staticExplorerContentProvenance(clusterId, logicalPath = '/oak-chain') {
+  const tree = staticExplorerContentTree(clusterId, logicalPath);
+  return {
+    ...tree,
+    writeMetadata: tree.cluster.scope === 'local'
+      ? { matchPath: logicalPath, exact: true, recordId: 'record-1', source: 'consensus', validator: 'http://localhost:8090', timestamp: Date.now(), message: 'seeded local write' }
+      : null,
+    walletAuthority: tree.cluster.scope === 'local'
+      ? { wallet: '0x1234567890abcdef1234567890abcdef12345678', ownership: 'local', l1Prefix: '12', scope: 'local', readOnly: false, redirectUrl: null }
+      : null,
+    contentFacts: {
+      readOnly: tree.cluster.scope === 'remote',
+      authoritative: tree.cluster.scope === 'local',
+      propertyCount: 2,
+      childCount: 1,
+    },
   };
 }
 
@@ -1591,10 +2004,27 @@ async function resolveTransactionDetail(transactionId) {
 }
 
 async function resolveNetwork() {
-  const [health, cluster] = await Promise.all([
+  const [health, cluster, contentNav] = await Promise.all([
     resolveHealth().catch(() => ({})),
     resolveCluster().catch(() => ({ nodes: [] })),
+    resolveExplorerContentNav().catch(() => null),
   ]);
+  if (contentNav && typeof contentNav === 'object') {
+    const localCluster = pick(contentNav, ['localCluster'], {});
+    return {
+      topologyModel: pick(contentNav, ['topologyModel'], 'Aeron fiefdoms + lazy read fabric'),
+      networkStatus: pick(contentNav, ['networkStatus'], String(pick(health, ['status'], 'unknown')).toLowerCase()),
+      localCluster: {
+        ...localCluster,
+        nodeCount: toNum(pick(localCluster, ['nodeCount'], pick(cluster, ['nodes'], []).length), pick(cluster, ['nodes'], []).length),
+        status: pick(localCluster, ['status'], pick(cluster, ['clusterState'], 'unknown')),
+        leaderLabel: pick(localCluster, ['leaderLabel'], pick(cluster, ['leaderNodeId'], null) !== null ? `Node ${pick(cluster, ['leaderNodeId'], '--')} leads` : 'Leader unresolved'),
+      },
+      mountedNeighbors: Array.isArray(pick(contentNav, ['mountedNeighbors'], [])) ? pick(contentNav, ['mountedNeighbors'], []) : [],
+      outerNetwork: pick(contentNav, ['outerNetwork'], {}),
+      cacheHints: pick(contentNav, ['cacheHints'], {}),
+    };
+  }
   const nodes = Array.isArray(pick(cluster, ['nodes'], [])) ? pick(cluster, ['nodes'], []) : [];
   return {
     status: String(pick(health, ['status'], 'unknown')),
@@ -1719,7 +2149,28 @@ function notFound(res) {
   });
 }
 
-function handle(req, res) {
+function normalizeRequestUrl(rawUrl) {
+  const url = new URL(rawUrl || '/', `http://localhost:${PORT}`);
+  if (url.pathname !== '/oak-chain-action') {
+    return url;
+  }
+
+  const route = String(url.searchParams.get('route') || '')
+    .replace(/^\/+/, '')
+    .replace(/^ops\/v1\//, '');
+  if (!route) {
+    return url;
+  }
+
+  const forwarded = new URL(`/ops/v1/${route}`, url);
+  url.searchParams.forEach((value, key) => {
+    if (key === 'route') return;
+    forwarded.searchParams.append(key, value);
+  });
+  return forwarded;
+}
+
+export function handle(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
@@ -1730,7 +2181,7 @@ function handle(req, res) {
     return;
   }
 
-  const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+  const url = normalizeRequestUrl(req.url);
   const path = url.pathname;
 
   if (req.method !== 'GET') {
@@ -1778,14 +2229,20 @@ function handle(req, res) {
   }
 
   if (path === '/ops/v1/network' && MODE === 'static') {
+    const nav = staticExplorerContentNav();
     sendJson(res, 200, envelope({
-      status: 'healthy',
-      api: 'UP',
-      cluster: 'UP',
-      storage: 'UP',
-      nodeCount: 3,
-      reachableNodes: 3,
+      topologyModel: nav.topologyModel,
+      networkStatus: nav.networkStatus,
+      localCluster: nav.localCluster,
+      mountedNeighbors: nav.mountedNeighbors,
+      outerNetwork: nav.outerNetwork,
+      cacheHints: nav.cacheHints,
     }));
+    return;
+  }
+
+  if (path === '/ops/v1/index' && MODE === 'static') {
+    sendJson(res, 200, envelope(staticExplorerIndex()));
     return;
   }
 
@@ -1836,8 +2293,11 @@ function handle(req, res) {
     return;
   }
 
-  if (path.startsWith('/ops/v1/explorer/proposal/') && MODE === 'static') {
-    const proposalId = decodeURIComponent(path.substring('/ops/v1/explorer/proposal/'.length));
+  if ((path.startsWith('/ops/v1/explorer/proposal/') || path.startsWith('/ops/v1/explorer/proposals/')) && MODE === 'static') {
+    const proposalPrefix = path.startsWith('/ops/v1/explorer/proposals/')
+      ? '/ops/v1/explorer/proposals/'
+      : '/ops/v1/explorer/proposal/';
+    const proposalId = decodeURIComponent(path.substring(proposalPrefix.length));
     sendJson(res, 200, envelope(staticExplorerProposalDetail(proposalId)));
     return;
   }
@@ -1846,6 +2306,31 @@ function handle(req, res) {
     const walletAddress = decodeURIComponent(path.substring('/ops/v1/explorer/wallets/'.length));
     sendJson(res, 200, envelope(staticExplorerWalletDetail(walletAddress)));
     return;
+  }
+
+  if (path === '/ops/v1/explorer/content/nav' && MODE === 'static') {
+    sendJson(res, 200, envelope(staticExplorerContentNav()));
+    return;
+  }
+
+  if (path.startsWith('/ops/v1/explorer/content/clusters/') && MODE === 'static') {
+    const suffix = path.substring('/ops/v1/explorer/content/clusters/'.length);
+    const separator = suffix.indexOf('/');
+    const clusterId = separator > 0 ? decodeURIComponent(suffix.slice(0, separator)) : '';
+    const action = separator > 0 ? suffix.slice(separator + 1) : '';
+    const logicalPath = url.searchParams.get('path') || '/oak-chain';
+    if (action === 'tree') {
+      sendJson(res, 200, envelope(staticExplorerContentTree(clusterId, logicalPath)));
+      return;
+    }
+    if (action === 'node') {
+      sendJson(res, 200, envelope(staticExplorerContentNode(clusterId, logicalPath)));
+      return;
+    }
+    if (action === 'provenance') {
+      sendJson(res, 200, envelope(staticExplorerContentProvenance(clusterId, logicalPath)));
+      return;
+    }
   }
 
   if (path === '/ops/v1/cluster' && MODE === 'static') {
@@ -2367,6 +2852,10 @@ function handle(req, res) {
         sendJson(res, 200, envelope(await resolveOverview()));
         return;
       }
+      if (path === '/ops/v1/index') {
+        sendJson(res, 200, envelope(await resolveExplorerIndex()));
+        return;
+      }
       if (path === '/ops/v1/header') {
         sendJson(res, 200, envelope(await resolveHeader()));
         return;
@@ -2379,8 +2868,11 @@ function handle(req, res) {
         sendJson(res, 200, envelope(await resolveExplorerSummary()));
         return;
       }
-      if (path.startsWith('/ops/v1/explorer/proposal/')) {
-        const proposalId = decodeURIComponent(path.substring('/ops/v1/explorer/proposal/'.length));
+      if (path.startsWith('/ops/v1/explorer/proposal/') || path.startsWith('/ops/v1/explorer/proposals/')) {
+        const proposalPrefix = path.startsWith('/ops/v1/explorer/proposals/')
+          ? '/ops/v1/explorer/proposals/'
+          : '/ops/v1/explorer/proposal/';
+        const proposalId = decodeURIComponent(path.substring(proposalPrefix.length));
         sendJson(res, 200, envelope(await resolveExplorerProposal(proposalId)));
         return;
       }
@@ -2388,6 +2880,29 @@ function handle(req, res) {
         const walletAddress = decodeURIComponent(path.substring('/ops/v1/explorer/wallets/'.length));
         sendJson(res, 200, envelope(await resolveExplorerWallet(walletAddress)));
         return;
+      }
+      if (path === '/ops/v1/explorer/content/nav') {
+        sendJson(res, 200, envelope(await resolveExplorerContentNav()));
+        return;
+      }
+      if (path.startsWith('/ops/v1/explorer/content/clusters/')) {
+        const suffix = path.substring('/ops/v1/explorer/content/clusters/'.length);
+        const separator = suffix.indexOf('/');
+        const clusterId = separator > 0 ? decodeURIComponent(suffix.slice(0, separator)) : '';
+        const action = separator > 0 ? suffix.slice(separator + 1) : '';
+        const logicalPath = url.searchParams.get('path') || '/oak-chain';
+        if (action === 'tree') {
+          sendJson(res, 200, envelope(await resolveExplorerContentTree(clusterId, logicalPath)));
+          return;
+        }
+        if (action === 'node') {
+          sendJson(res, 200, envelope(await resolveExplorerContentNode(clusterId, logicalPath)));
+          return;
+        }
+        if (action === 'provenance') {
+          sendJson(res, 200, envelope(await resolveExplorerContentProvenance(clusterId, logicalPath)));
+          return;
+        }
       }
       if (path === '/ops/v1/cluster') {
         sendJson(res, 200, envelope(await resolveCluster()));
@@ -2548,10 +3063,57 @@ function handle(req, res) {
   })();
 }
 
-const server = http.createServer(handle);
-server.listen(PORT, HOST, () => {
-  // eslint-disable-next-line no-console
-  console.log(`Ops API adapter listening on http://${HOST}:${PORT}`);
-  // eslint-disable-next-line no-console
-  console.log(`Mode=${MODE} Upstream=${UPSTREAM_BASE}`);
-});
+export function handleWebRequest(request) {
+  return new Promise((resolve) => {
+    const responseState = {
+      status: 200,
+      headers: {},
+    };
+    const req = {
+      method: request.method,
+      url: request.url,
+      headers: {
+        authorization: request.headers.get('authorization') || undefined,
+      },
+    };
+    const res = {
+      writeHead(status, headers = {}) {
+        responseState.status = status;
+        responseState.headers = headers;
+      },
+      end(body = '') {
+        resolve(new Response(body, {
+          status: responseState.status,
+          headers: responseState.headers,
+        }));
+      },
+    };
+    handle(req, res);
+  });
+}
+
+function isDirectNodeExecution() {
+  if (typeof process === 'undefined' || !Array.isArray(process.argv) || !process.argv[1]) {
+    return false;
+  }
+  try {
+    return import.meta.url === new URL(`file://${process.argv[1]}`).href;
+  } catch (_e) {
+    return false;
+  }
+}
+
+async function startNodeServer() {
+  const http = await import('node:http');
+  const server = http.createServer(handle);
+  server.listen(PORT, HOST, () => {
+    // eslint-disable-next-line no-console
+    console.log(`Ops API adapter listening on http://${HOST}:${PORT}`);
+    // eslint-disable-next-line no-console
+    console.log(`Mode=${MODE} Upstream=${UPSTREAM_BASE}`);
+  });
+}
+
+if (isDirectNodeExecution()) {
+  startNodeServer();
+}
