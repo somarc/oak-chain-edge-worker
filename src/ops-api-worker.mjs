@@ -156,6 +156,42 @@ function parsePort(urlValue) {
   }
 }
 
+function isPrivateHostname(hostname) {
+  const normalized = String(hostname || '').trim().toLowerCase();
+  if (!normalized) return true;
+  if (
+    normalized === 'localhost'
+    || normalized === '127.0.0.1'
+    || normalized === '0.0.0.0'
+    || normalized === '::1'
+    || normalized === '[::1]'
+    || normalized.endsWith('.local')
+  ) {
+    return true;
+  }
+  if (/^10\./.test(normalized)) return true;
+  if (/^192\.168\./.test(normalized)) return true;
+  if (/^169\.254\./.test(normalized)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(normalized)) return true;
+  return false;
+}
+
+export function resolveReachableUpstreamBase(candidate, fallback = UPSTREAM_BASE) {
+  const normalizedFallback = String(fallback || UPSTREAM_BASE).replace(/\/$/, '');
+  try {
+    const parsed = new URL(candidate);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return normalizedFallback;
+    }
+    if (isPrivateHostname(parsed.hostname)) {
+      return normalizedFallback;
+    }
+    return String(candidate || '').replace(/\/$/, '');
+  } catch (_e) {
+    return normalizedFallback;
+  }
+}
+
 function normalizeNodeIds(rawNodes) {
   if (!Array.isArray(rawNodes)) return [];
   const used = new Set();
@@ -673,7 +709,7 @@ async function resolveLeaderUpstreamBase() {
     const leader = await upstreamGet('/v1/consensus/leader');
     const directLeader = pick(leader, ['currentLeader'], null);
     if (typeof directLeader === 'string' && directLeader.length > 0) {
-      return directLeader.replace(/\/$/, '');
+      return resolveReachableUpstreamBase(directLeader);
     }
   } catch (_e) {
     // Fall through to legacy endpoints.
@@ -682,7 +718,7 @@ async function resolveLeaderUpstreamBase() {
     const consensus = await upstreamGet('/v1/consensus/status');
     const currentLeader = pick(consensus, ['currentLeader'], null);
     if (typeof currentLeader === 'string' && currentLeader.length > 0) {
-      return currentLeader.replace(/\/$/, '');
+      return resolveReachableUpstreamBase(currentLeader);
     }
   } catch (_e) {
     // Fall through to runtime source snapshot.
@@ -692,14 +728,14 @@ async function resolveLeaderUpstreamBase() {
     const aeron = pick(runtime, ['aeron'], {});
     const directLeader = pick(aeron, ['currentLeader', 'leaderHint'], null);
     if (typeof directLeader === 'string' && directLeader.length > 0) {
-      return directLeader.replace(/\/$/, '');
+      return resolveReachableUpstreamBase(directLeader);
     }
     const members = pick(pick(aeron, ['validatorIdentities'], {}), ['validators'], []);
     if (Array.isArray(members)) {
       const leader = members.find((m) => String(pick(m, ['role'], '')).toUpperCase() === 'LEADER');
       const leaderUrl = pick(leader, ['url'], null);
       if (typeof leaderUrl === 'string' && leaderUrl.length > 0) {
-        return leaderUrl.replace(/\/$/, '');
+        return resolveReachableUpstreamBase(leaderUrl);
       }
     }
   } catch (_e) {
