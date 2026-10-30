@@ -9,7 +9,6 @@ const repoRoot = path.resolve(__dirname, '..');
 
 const files = [
   path.join(repoRoot, 'src/ops-api-worker.mjs'),
-  path.resolve(repoRoot, '../oak-chain-dashboard-eds/scripts/ops-api-mock.mjs'),
 ];
 
 const checks = [

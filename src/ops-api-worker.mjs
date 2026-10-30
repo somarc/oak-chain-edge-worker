@@ -2185,27 +2185,6 @@ function notFound(res) {
   });
 }
 
-function normalizeRequestUrl(rawUrl) {
-  const url = new URL(rawUrl || '/', `http://localhost:${PORT}`);
-  if (url.pathname !== '/oak-chain-action') {
-    return url;
-  }
-
-  const route = String(url.searchParams.get('route') || '')
-    .replace(/^\/+/, '')
-    .replace(/^ops\/v1\//, '');
-  if (!route) {
-    return url;
-  }
-
-  const forwarded = new URL(`/ops/v1/${route}`, url);
-  url.searchParams.forEach((value, key) => {
-    if (key === 'route') return;
-    forwarded.searchParams.append(key, value);
-  });
-  return forwarded;
-}
-
 export function handle(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -2217,7 +2196,7 @@ export function handle(req, res) {
     return;
   }
 
-  const url = normalizeRequestUrl(req.url);
+  const url = new URL(req.url || '/', `http://localhost:${PORT}`);
   const path = url.pathname;
 
   if (req.method !== 'GET') {

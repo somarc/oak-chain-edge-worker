@@ -12,17 +12,6 @@ test('worker serves direct ops routes', async () => {
   assert.equal(payload.data.status, 'healthy');
 });
 
-test('worker preserves hosted oak-chain-action compatibility routes', async () => {
-  const response = await worker.fetch(
-    new Request('https://worker.example/oak-chain-action?route=explorer/summary'),
-    {},
-  );
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  assert.equal(payload.version, 'v1');
-  assert.equal(payload.data.contractVersion, 'explorer.v1');
-});
-
 test('private leader hints fall back to the public upstream base', () => {
   assert.equal(
     resolveReachableUpstreamBase('http://localhost:8094', 'https://9740-192-150-5-2.ngrok-free.app'),
