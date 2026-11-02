@@ -66,7 +66,7 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/config/osgi/coverage': 'config.osgi.coverage.v1',
   '/v1/config/osgi/delta': 'config.osgi.delta.v1',
   '/v1/blockchain/config': 'blockchain.config.v1',
-  '/v1/gc/status': 'gc.status.v1',
+  '/v1/gc/status': 'gc.status.v2',
   '/v1/explorer/proposals/{proposalId}': 'explorer.v1',
   '/v1/explorer/wallets/{walletAddress}': 'explorer.v1',
 });
@@ -2491,12 +2491,9 @@ export function handle(req, res) {
 
   if (path === '/ops/v1/gc/status' && MODE === 'static') {
     sendJson(res, 200, envelope({
-      gcEnabled: true,
-      pendingProposals: 0,
-      lastGcRun: null,
-      lastGcReclaimedMB: null,
-      lastGcCostUSDC: null,
-      gcConsensusRequired: true,
+      contractVersion: 'gc.status.v2',
+      segment: { enabled: true, oakStatus: 'idle', running: null, lastRun: { tail: null, full: null } },
+      binary: { enabled: true, lastMark: null, lastRelease: null },
     }));
     return;
   }
