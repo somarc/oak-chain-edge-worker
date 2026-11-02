@@ -7,7 +7,12 @@
   "scripts": {
     "start": "node src/ops-api-worker.mjs",
     "dev": "node src/ops-api-worker.mjs",
-    "check": "node --check src/ops-api-worker.mjs"
+    "dev:worker": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "deploy:quick": "bash ./bin/deploy-cloudflare.sh",
+    "whoami": "npx wrangler whoami",
+    "check": "node --check src/ops-api-worker.mjs && node --check src/cloudflare-worker.mjs && node scripts/check-governed-sources.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"

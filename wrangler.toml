@@ -1,0 +1,10 @@
+name = "oak-chain-edge-worker"
+main = "src/cloudflare-worker.mjs"
+compatibility_date = "2026-03-27"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+OPS_MOCK_MODE = "static"
+OPS_MOCK_CLUSTER_ID = "oak-local-a"
+OPS_CHAIN_MODE = "mock"
