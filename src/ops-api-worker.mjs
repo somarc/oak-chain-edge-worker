@@ -53,7 +53,6 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/ops/snapshots/replication': 'ops.v1',
   '/v1/ops/snapshots/queue': 'ops.v1',
   '/v1/proposals/release-flow': 'release-flow.v1',
-  '/v1/proposals/epochs': 'proposal.epoch-overlay.v1',
   '/v1/explorer/summary': 'explorer.v1',
   '/v1/explorer/content/nav': 'explorer.content.v1',
   '/v1/explorer/content/clusters/{clusterId}/tree': 'explorer.content.v1',
@@ -68,13 +67,8 @@ const SOURCE_CONTRACT_VERSIONS = Object.freeze({
   '/v1/config/osgi/delta': 'config.osgi.delta.v1',
   '/v1/blockchain/config': 'blockchain.config.v1',
   '/v1/gc/status': 'gc.status.v1',
-  '/v1/gc/estimate': 'gc.estimate.v1',
-  '/v1/compaction/proposals': 'gc.compaction.proposals.v1',
   '/v1/explorer/proposals/{proposalId}': 'explorer.v1',
   '/v1/explorer/wallets/{walletAddress}': 'explorer.v1',
-  '/v1/fragmentation/metrics': 'fragmentation.metrics.v1',
-  '/v1/fragmentation/metrics/{walletAddress}': 'fragmentation.metrics.entity.v1',
-  '/v1/fragmentation/top': 'fragmentation.top.v1',
 });
 const EXPLORER_CACHE = new ExplorerNamespaceCache({
   chainMode: CHAIN_MODE,
@@ -952,16 +946,6 @@ async function resolveExplorerContentProvenance(clusterId, logicalPath = '/oak-c
   );
 }
 
-async function resolveFragmentationMetricsByWallet(walletAddress, leaderBase = UPSTREAM_BASE) {
-  return upstreamGetUnwrapped(`/v1/fragmentation/metrics/${encodeURIComponent(walletAddress)}`, leaderBase);
-}
-
-async function resolveFragmentationTop(url, leaderBase = UPSTREAM_BASE) {
-  const requestedLimit = Number(url?.searchParams?.get('limit') || 10);
-  const limit = Math.max(1, Math.min(Number.isFinite(requestedLimit) ? requestedLimit : 10, 100));
-  return upstreamGetUnwrapped(`/v1/fragmentation/top?limit=${limit}`, leaderBase);
-}
-
 function findLeader(nodes) {
   if (!Array.isArray(nodes)) return null;
   return nodes.find((n) => String(pick(n, ['role'], '')).toUpperCase() === 'LEADER') || null;
@@ -1138,16 +1122,6 @@ async function resolveProposals() {
 }
 
 async function resolveProposalEpochs() {
-  try {
-    const leaderBase = await resolveLeaderUpstreamBase();
-    const upstream = await upstreamGetFromBase('/v1/proposals/epochs', leaderBase);
-    if (upstream && Array.isArray(upstream.blocks) && upstream.blocks.length > 0) {
-      return upstream;
-    }
-  } catch (_e) {
-    // Fall back to derived payload while compatibility overlay converges.
-  }
-
   const proposals = await resolveProposals();
   const states = pick(proposals, ['states'], {});
   const queuePressure = pick(proposals, ['queuePressure'], {});
@@ -1470,57 +1444,6 @@ function staticExplorerContentProvenance(clusterId, logicalPath = '/oak-chain') 
   };
 }
 
-function staticFragmentationEntityMetrics(walletAddress) {
-  return {
-    contractVersion: 'fragmentation.metrics.entity.v1',
-    walletAddress,
-    data: {
-      walletAddress,
-      tarFilesCreated: 0,
-      totalBytesWritten: 0,
-      totalBytesWrittenFormatted: '0 B',
-      averageTarFileSize: 0,
-      averageTarFileSizeFormatted: '0 B',
-      packingEfficiency: '0.00',
-      smallTarFileCount: 0,
-      fragmentationScore: 0,
-      fragmentationTax: '0',
-      fragmentationTaxFormatted: '0.0 ETH',
-      lastWriteTimestamp: null,
-      tarFiles: [],
-    },
-  };
-}
-
-function staticFragmentationTop(limit) {
-  const cappedLimit = Math.max(1, Math.min(Number.isFinite(limit) ? limit : 10, 100));
-  const sampleEntities = [
-    '0x1111111111111111111111111111111111111111',
-    '0x2222222222222222222222222222222222222222',
-    '0x3333333333333333333333333333333333333333',
-  ].slice(0, Math.min(cappedLimit, 3)).map((walletAddress, index) => ({
-    walletAddress,
-    tarFilesCreated: 12 - index,
-    totalBytesWritten: 1048576 * (index + 1),
-    totalBytesWrittenFormatted: formatBytes(1048576 * (index + 1)),
-    averageTarFileSize: 524288 * (index + 1),
-    averageTarFileSizeFormatted: formatBytes(524288 * (index + 1)),
-    packingEfficiency: String((37.5 + (index * 7.5)).toFixed(2)),
-    smallTarFileCount: index,
-    fragmentationScore: 80 - (index * 10),
-    fragmentationTax: String(2500 + (index * 500)),
-    fragmentationTaxFormatted: `${2.5 + (index * 0.5)} ETH`,
-    lastWriteTimestamp: nowIso(),
-    tarFiles: [`data0000${index}a.tar`],
-  }));
-
-  return {
-    contractVersion: 'fragmentation.top.v1',
-    limit: cappedLimit,
-    entities: sampleEntities,
-  };
-}
-
 async function resolveProposalReleaseFlow() {
   try {
     const leaderBase = await resolveLeaderUpstreamBase();
@@ -1785,17 +1708,6 @@ async function resolveSignals() {
       description: 'Media driver timeout events.',
     }),
     buildSignal({
-      id: 'media_driver.backpressure_count',
-      label: 'MediaDriver Backpressure',
-      category: 'aeron',
-      value: toNum(pick(deepMedia, ['backpressureCount'], 0), 0),
-      unit: 'count',
-      warnThreshold: 1,
-      criticalThreshold: 10,
-      source: '/v1/ops/snapshots/runtime',
-      description: 'Backpressure events tracked by media driver.',
-    }),
-    buildSignal({
       id: 'disk.usage_percent',
       label: 'Disk Usage',
       category: 'storage',
@@ -1871,7 +1783,6 @@ async function resolveHealth() {
         healthStatus: String(pick(runtimeMedia, ['healthStatus'], 'unknown')),
         errorCount: toNum(pick(runtimeMedia, ['errorCount'], 0), 0),
         timeoutCount: toNum(pick(runtimeMedia, ['timeoutCount'], 0), 0),
-        backpressureCount: toNum(pick(runtimeMedia, ['backpressureCount'], 0), 0),
       },
       consensus: {
         status: String(pick(runtimeAeron, ['status'], 'unknown')),
@@ -2647,8 +2558,6 @@ export function handle(req, res) {
       healthStatus: 'HEALTHY',
       errorCount: 0,
       timeoutCount: 0,
-      backpressureCount: 0,
-      freeSpaceMB: 512,
       hasCrashed: false,
       forceBootstrap: false,
     }));
@@ -2800,50 +2709,6 @@ export function handle(req, res) {
       displayName: 'MOCK MODE',
       badgeColor: '#fbbf24',
     }));
-    return;
-  }
-
-  if (path === '/ops/v1/gc/estimate' && MODE === 'static') {
-    sendJson(res, 200, envelope({
-      contractVersion: 'gc.estimate.v1',
-      reclaimableSegmentCount: 0,
-      reclaimableSizeBytes: 0,
-      reclaimableSizeMB: 0,
-      reclaimablePercentage: '0.00',
-      totalSegmentCount: 1617,
-      totalSizeBytes: 31628800,
-      totalSizeMB: 30,
-      estimatedCostUSDC: '0.00',
-      reclaimableByTarFile: {},
-    }));
-    return;
-  }
-
-  if (path === '/ops/v1/compaction/proposals' && MODE === 'static') {
-    sendJson(res, 200, envelope({
-      contractVersion: 'gc.compaction.proposals.v1',
-      proposals: [],
-    }));
-    return;
-  }
-
-  if (path === '/ops/v1/fragmentation/metrics' && MODE === 'static') {
-    sendJson(res, 200, envelope({
-      contractVersion: 'fragmentation.metrics.v1',
-      totalEntities: 0,
-      entities: [],
-    }));
-    return;
-  }
-
-  if (path.startsWith('/ops/v1/fragmentation/metrics/') && MODE === 'static') {
-    const walletAddress = decodeURIComponent(path.substring('/ops/v1/fragmentation/metrics/'.length));
-    sendJson(res, 200, envelope(staticFragmentationEntityMetrics(walletAddress)));
-    return;
-  }
-
-  if (path === '/ops/v1/fragmentation/top' && MODE === 'static') {
-    sendJson(res, 200, envelope(staticFragmentationTop(Number(url.searchParams.get('limit') || 10))));
     return;
   }
 
@@ -3021,27 +2886,6 @@ export function handle(req, res) {
       }
       if (path === '/ops/v1/gc/status') {
         sendJson(res, 200, envelope(await upstreamGetUnwrapped('/v1/gc/status')));
-        return;
-      }
-      if (path === '/ops/v1/gc/estimate') {
-        sendJson(res, 200, envelope(await upstreamGetUnwrapped('/v1/gc/estimate')));
-        return;
-      }
-      if (path === '/ops/v1/compaction/proposals') {
-        sendJson(res, 200, envelope(await upstreamGetUnwrapped('/v1/compaction/proposals')));
-        return;
-      }
-      if (path === '/ops/v1/fragmentation/metrics') {
-        sendJson(res, 200, envelope(await upstreamGetUnwrapped('/v1/fragmentation/metrics')));
-        return;
-      }
-      if (path.startsWith('/ops/v1/fragmentation/metrics/')) {
-        const walletAddress = decodeURIComponent(path.substring('/ops/v1/fragmentation/metrics/'.length));
-        sendJson(res, 200, envelope(await resolveFragmentationMetricsByWallet(walletAddress)));
-        return;
-      }
-      if (path === '/ops/v1/fragmentation/top') {
-        sendJson(res, 200, envelope(await resolveFragmentationTop(url)));
         return;
       }
       if (path === '/ops/v1/finality') {
